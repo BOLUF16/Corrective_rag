@@ -2,19 +2,23 @@ import os
 from pathlib import Path
 from werkzeug.utils import secure_filename
 from src.exception.operationhandler import system_logger, userops_logger, llmresponse_logger
-from src.config.appconfig import *
 from langchain_community.embeddings import HuggingFaceInferenceAPIEmbeddings
-from langchain_community.document_loaders import PyMuPDFLoader, TextLoader, CSVLoader, JSONLoader, Docx2txtLoader
+from langchain_community.document_loaders import PyMuPDFLoader, TextLoader, CSVLoader,  Docx2txtLoader
+from langchain_docling import DoclingLoader
+from langchain_docling.loader import ExportType
+from docling.chunking import HybridChunker
 from langchain.docstore.document import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_text_splitters import MarkdownHeaderTextSplitter
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams
 from langchain_qdrant import Qdrant, QdrantVectorStore
 from fastapi import HTTPException
 from langchain_community.tools import TavilySearchResults
+from src.settings import settings
 
 
-allowed_files = ["txt", "csv", "json", "pdf", "doc", "docx"]
+allowed_files = ["txt", "csv", "pdf", "doc", "docx"]
 
 def allowed_file(filename:str):
     return "." in filename and filename.rsplit(".", 1)[1].lower() in allowed_files
@@ -56,9 +60,7 @@ async def upload_files(files, temp_dir):
 
             with open(file_path, "wb") as buffer:
                 buffer.write(file_obj)
-            
-            print(f"File saved to: {file_path}")  # Debugging statement
-            system_logger.info(f"File successfully uploaded to {file_path}")
+                
         return {
                 "detail" : "Upload completed",
                 "status_code": 200
@@ -81,25 +83,39 @@ class DocumentProcessor:
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
         self.system_log = system_logger
-        self.qdrant_url = "https://398e383f-3b1b-4900-b002-88776d6c621f.us-east4-0.gcp.cloud.qdrant.io:6333"
-        self.qdrant_key = qdrant_key
-        self.collection_name = "corrective_rag" 
+        self.qdrant_url = settings.QDRANT_URL
+        self.qdrant_key = settings.QDRANT_API_KEY
+        
 
 
     def process_and_split_document(self, file_path: str):
         try:
             file_extension = Path(file_path).suffix.lower()
-            self.system_log.info(f"Loading file: {file_path}")
 
             # Choose the appropriate loader based on file type
             if file_extension == ".txt":
                 loader = TextLoader(file_path)
+            # if file_extension == ".md":
+            #     loader = DoclingLoader(
+            #         file_path = file_path,
+            #         export_type=ExportType.MARKDOWN,
+            #         chunker=HybridChunker(tokenizer="BAAI/bge-small-en-v1.5"))
+                
+            #     document = loader.load()
+            #     splitter = MarkdownHeaderTextSplitter(
+            #         headers_to_split_on=[("#", "Header 1"),
+            #         ("##", "Header 2"),
+            #         ("###", "Header 3"),]
+            #     )
+            #     document = loader.load()
+            #     splits = [split for doc in document for split in splitter.split_text(doc.page_content)]
+
+            #     return splits
+            
             elif file_extension == ".pdf":
                 loader = PyMuPDFLoader(file_path)
             elif file_extension == ".csv":
                 loader = CSVLoader(file_path)
-            elif file_extension == ".json":
-                loader = JSONLoader(file_path)
             elif file_extension in [".doc", ".docx"]:
                 loader = Docx2txtLoader(file_path)
             else:
@@ -131,9 +147,9 @@ class DocumentProcessor:
             raise HTTPException(status_code=500, detail=f"Could not process documents: {str(e)}")
 
     @staticmethod
-    def get_embedding(api_key: str):
+    def get_embedding():
         return HuggingFaceInferenceAPIEmbeddings(
-            api_key=api_key,
+            api_key=settings.HF_KEY,
             model_name="BAAI/bge-small-en-v1.5"
         )
 
@@ -145,88 +161,42 @@ class DocumentProcessor:
         try:
             # Check if collection exists
             collections = client.get_collections()
-            if self.collection_name not in [col.name for col in collections.collections]:
+            if settings.QDRANT_COLLECTION not in [col.name for col in collections.collections]:
                 client.create_collection(
-                    collection_name=self.collection_name,
+                    collection_name=settings.QDRANT_COLLECTION,
                     vectors_config=VectorParams(size=384, distance=Distance.COSINE)
                 )
-                self.system_log.info(f"Created new collection: {self.collection_name}")
+                self.system_log.info(f"Created new collection: {settings.QDRANT_COLLECTION}")
             else:
-                self.system_log.info(f"Using existing collection: {self.collection_name}")
+                # Check if existing collection has expected vector configuration
+                collection = client.get_collection(collection_name=settings.QDRANT_COLLECTION)
+                collection_config = collection.config.params.vectors
+                
+                if collection_config.size != 384 or collection_config.distance != Distance.COSINE:
+                    self.system_log.warning(
+                        f"Collection {collection} has unexpected configs:" f"Vector size {collection_config.size} and distance {collection_config.distance}"
+                    )
+                self.system_log.info(f"Using existing collection: {settings.QDRANT_COLLECTION}")
         except Exception as e:
             self.system_log.error(f"Error creating Qdrant collection: {str(e)}")
             raise
 
+        return client
+
     def create_vector_store(self, documents):
-        client = self.create_qdrant_client()
-        self.create_qdrant_collection()
 
-        return QdrantVectorStore.from_documents(
-            documents=documents,
-            embedding=self.get_embedding(hf_key),
-            url=self.qdrant_url,
-            api_key=self.qdrant_key,
-            collection_name=self.collection_name
-        )
-    
+        client = self.create_qdrant_collection()
 
-def web_search(query: str) -> list:
-    """
-    Perform a web search using the Tavily API and process the results.
-
-    Args:
-        query (str): The search query.
-
-    Returns:
-        list: A list of strings containing the search results. Each string includes the title, content, and link of a search result.
-              If the search fails or no results are found, returns a list with a single dictionary containing the query.
-    """
-    try:
-        system_logger.info(f"Initiating web search for query: {query}")
-
-        # Initialize the Tavily search tool
-        tool = TavilySearchResults(
-            api_key=tavily_key,  
-            max_results=3,
-            search_depth="advanced"
-        )
-
-        # Execute the search
-        try:
-            search_results = tool.invoke({"query": query})
-        except Exception as e:
-            system_logger.error(f"Failed to execute search: {str(e)}")
-            return [{"key": {"question": query}}]
-
-        # Check if results are empty
-        if not search_results:
-            system_logger.warning("No search results found.")
-            return [{"key": {"question": query}}]
-
-        # Process and format the search results
-        system_logger.info(f"Processing {len(search_results)} search results...")
-        web_results = [
-            f"Content: {result.get('content', 'No content')}\n"
-            f"Link: {result.get('url', 'No link')}\n"
-            for result in search_results
-        ]
-
-        return web_results
-
-    except Exception as e:
-        system_logger.error(f"An unexpected error occurred: {str(e)}")
-        return [{"key": {"question": query}}]
-
-
-
-
-
-
+        vectorstore = Qdrant(
+                    client=client,
+                    embeddings= self.get_embedding(),
+                    collection_name= settings.QDRANT_COLLECTION
+                    )
+        
+        vectorstore.add_documents(documents)
+        self.system_log.info(f"vector store succesfully created")
+        
+        return {"status":"success"}
 
     
 
-
-    
-    
-
-    
